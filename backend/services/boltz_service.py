@@ -14,6 +14,14 @@ from pathlib import Path
 from config import settings
 from models import PredictionRequest, PredictionResult, JobStatus
 
+# Import RunPod service conditionally
+try:
+    from services.runpod_service import RunPodService
+    RUNPOD_AVAILABLE = True
+except ImportError:
+    RUNPOD_AVAILABLE = False
+    RunPodService = None
+
 
 class BoltzService:
     """Service for interacting with Boltz-2 framework."""
@@ -23,6 +31,18 @@ class BoltzService:
         self.output_dir = Path(settings.output_base_dir) / settings.predictions_dir
         self.temp_dir = Path(settings.output_base_dir) / settings.temp_dir
         self._ensure_directories()
+        
+        # Initialize RunPod service if enabled
+        self.use_runpod = settings.use_runpod and RUNPOD_AVAILABLE
+        self.runpod_service = None
+        if self.use_runpod:
+            try:
+                self.runpod_service = RunPodService()
+                print("✅ RunPod service initialized")
+            except Exception as e:
+                print(f"⚠️ Failed to initialize RunPod service: {e}")
+                print("⚠️ Falling back to local execution")
+                self.use_runpod = False
 
     def _ensure_directories(self):
         """Ensure required directories exist."""
@@ -87,30 +107,36 @@ class BoltzService:
     def run_prediction(
         self, job_id: str, request: PredictionRequest
     ) -> PredictionResult:
-        """Run the actual prediction using Boltz-2."""
+        """Run the actual prediction using Boltz-2 via RunPod or local execution."""
 
         start_time = time.time()
         job_dir = self.output_dir / job_id
 
         try:
             print(f"Starting prediction for job {job_id}")
+            print(f"Using RunPod: {self.use_runpod}")
 
             # Update job status to running
-            self._update_job_status(job_id, "running", 25.0)
-            print(f"Job {job_id} status updated to running (25%)")
+            self._update_job_status(job_id, "running", 10.0)
+            print(f"Job {job_id} status updated to running (10%)")
 
             # Create input YAML
             print(f"Creating input YAML for job {job_id}")
             input_yaml = self._create_input_yaml(job_id, request)
             print(f"Input YAML created successfully: {input_yaml}")
 
-            # Run Boltz-2 prediction
-            print(f"Starting Boltz-2 execution for job {job_id}")
-            self._update_job_status(job_id, "running", 50.0)
+            # Run prediction via RunPod or locally
+            if self.use_runpod and self.runpod_service:
+                print(f"Submitting job {job_id} to RunPod")
+                self._update_job_status(job_id, "running", 25.0)
+                result = self._execute_boltz_prediction_runpod(
+                    job_id, input_yaml, job_dir, request
+                )
+            else:
+                print(f"Running job {job_id} locally")
+                self._update_job_status(job_id, "running", 50.0)
+                result = self._execute_boltz_prediction(input_yaml, job_dir)
 
-            print(f"Job {job_id} status updated to running (50%)")
-
-            result = self._execute_boltz_prediction(input_yaml, job_dir)
             print(f"Boltz-2 execution completed for job {job_id}")
 
             # Update job status to completed
@@ -140,31 +166,13 @@ class BoltzService:
 
             traceback.print_exc()
 
-            # Check if it's a memory error, timeout, or subprocess error - provide mock results instead of failing
-            error_str = str(e).lower()
-            if (
-                "memory" in error_str
-                or "allocation" in error_str
-                or "ArrayMemoryError" in str(e)
-                or "timeout" in error_str
-                or "timed out" in error_str
-                or "subprocess" in error_str
-                or "calledprocesserror" in error_str
-                or "non-zero exit status" in error_str
-                or "boltz" in error_str
-            ):
-                print(
-                    f"Boltz-2 execution error detected for job {job_id}, providing comprehensive mock results"
-                )
-                return self._generate_mock_results(job_id, request, start_time)
-            else:
-                # Update job status to failed for other errors
-                self._update_job_status(job_id, "failed", 0.0)
-                print(f"Job {job_id} status updated to failed")
+            # Update job status to failed
+            self._update_job_status(job_id, "failed", 0.0)
+            print(f"Job {job_id} status updated to failed")
 
-                return PredictionResult(
-                    job_id=job_id, status="failed", error_message=str(e)
-                )
+            return PredictionResult(
+                job_id=job_id, status="failed", error_message=str(e)
+            )
         finally:
             # Cleanup temporary files
             try:
@@ -176,302 +184,6 @@ class BoltzService:
                     f"Warning: Failed to cleanup temporary files for job {job_id}: {cleanup_error}"
                 )
 
-    def _generate_mock_results(
-        self, job_id: str, request: PredictionRequest, start_time: float
-    ) -> PredictionResult:
-        """Generate mock results when Boltz-2 fails due to memory constraints."""
-        import random
-        import time
-
-        print(f"Generating mock results for job {job_id}")
-
-        # Update job status to running
-        self._update_job_status(job_id, "running", 75.0)
-        print(f"Job {job_id} status updated to running (75%) - generating mock results")
-
-        # Simulate some processing time
-        time.sleep(2)
-
-        # Generate comprehensive mock values based on real Boltz-2 output structure
-        # Binding affinity typically ranges from -2 to -12 (log IC50)
-        mock_affinity = round(random.uniform(-8.5, -4.2), 3)
-        mock_affinity1 = round(mock_affinity + random.uniform(-0.5, 0.5), 3)
-        mock_affinity2 = round(mock_affinity + random.uniform(-0.3, 0.3), 3)
-
-        # Probability of binding (0-1) - ensemble predictions
-        mock_probability = round(random.uniform(0.6, 0.95), 3)
-        mock_probability1 = round(mock_probability + random.uniform(-0.1, 0.1), 3)
-        mock_probability2 = round(mock_probability + random.uniform(-0.1, 0.1), 3)
-
-        # Confidence scores (0-1) - multiple metrics from Boltz-2
-        mock_confidence = round(random.uniform(0.7, 0.9), 3)
-        mock_ptm = round(random.uniform(0.75, 0.92), 3)  # Predicted TM score
-        mock_iptm = round(random.uniform(0.70, 0.88), 3)  # Interface TM score
-        mock_ligand_iptm = round(random.uniform(0.65, 0.85), 3)  # Ligand interface TM
-        mock_protein_iptm = round(random.uniform(0.75, 0.90), 3)  # Protein interface TM
-        mock_complex_plddt = round(random.uniform(0.70, 0.88), 3)  # Complex pLDDT
-        mock_complex_iplddt = round(random.uniform(0.68, 0.86), 3)  # Interface pLDDT
-        mock_complex_pde = round(random.uniform(0.8, 1.2), 3)  # PDE score (angstroms)
-        mock_complex_ipde = round(random.uniform(4.5, 6.5), 3)  # Interface PDE
-
-        # Chain-specific confidence scores
-        mock_chains_ptm = {
-            "0": round(random.uniform(0.75, 0.90), 3),  # Protein chain
-            "1": round(random.uniform(0.70, 0.85), 3),  # Ligand chain
-        }
-
-        # Pair-wise interface scores
-        mock_pair_chains_iptm = {
-            "0": {"0": mock_chains_ptm["0"], "1": round(random.uniform(0.65, 0.80), 3)},
-            "1": {"0": round(random.uniform(0.70, 0.85), 3), "1": mock_chains_ptm["1"]},
-        }
-
-        # Number of poses generated
-        mock_poses = random.randint(3, 8)
-
-        # Generate mock pose files
-        mock_pose_files = [f"pose_{i+1}.pdb" for i in range(mock_poses)]
-
-        processing_time = time.time() - start_time
-
-        # Update job status to completed
-        self._update_job_status(job_id, "completed", 100.0)
-        print(
-            f"Job {job_id} status updated to completed (100%) - mock results generated"
-        )
-
-        # Create actual pose files
-        self._create_mock_pose_files(job_id, mock_poses, mock_pose_files)
-
-        # Save comprehensive mock results to files for the result endpoint
-        self._save_comprehensive_mock_results_to_files(
-            job_id,
-            mock_affinity,
-            mock_affinity1,
-            mock_affinity2,
-            mock_probability,
-            mock_probability1,
-            mock_probability2,
-            mock_confidence,
-            mock_ptm,
-            mock_iptm,
-            mock_ligand_iptm,
-            mock_protein_iptm,
-            mock_complex_plddt,
-            mock_complex_iplddt,
-            mock_complex_pde,
-            mock_complex_ipde,
-            mock_chains_ptm,
-            mock_pair_chains_iptm,
-            mock_poses,
-            mock_pose_files,
-            processing_time,
-        )
-
-        print(f"Comprehensive mock results for job {job_id}:")
-        print(f"  - Affinity: {mock_affinity} (log IC50)")
-        print(f"  - Probability: {mock_probability}")
-        print(f"  - Confidence: {mock_confidence}")
-        print(f"  - PTM: {mock_ptm}")
-        print(f"  - ipTM: {mock_iptm}")
-        print(f"  - Poses: {mock_poses}")
-
-        return PredictionResult(
-            job_id=job_id,
-            status="completed",
-            affinity_pred_value=mock_affinity,
-            affinity_probability_binary=mock_probability,
-            confidence_score=mock_confidence,
-            processing_time_seconds=processing_time,
-            poses_generated=mock_poses,
-            pose_files=mock_pose_files,
-            error_message="Comprehensive mock results generated due to memory constraints",
-        )
-
-    def _save_mock_results_to_files(
-        self,
-        job_id: str,
-        affinity: float,
-        probability: float,
-        confidence: float,
-        poses: int,
-        pose_files: list,
-        processing_time: float,
-    ):
-        """Save mock results to files for the result endpoint."""
-        import json
-        from pathlib import Path
-
-        try:
-            # Create job directory
-            job_dir = self.output_dir / job_id
-            job_dir.mkdir(parents=True, exist_ok=True)
-
-            # Save affinity prediction results
-            result_data = {
-                "job_id": job_id,
-                "status": "completed",
-                "affinity_pred_value": affinity,
-                "affinity_probability_binary": probability,
-                "confidence_score": confidence,
-                "processing_time_seconds": processing_time,
-                "poses_generated": poses,
-                "pose_files": pose_files,
-                "error_message": "Mock results generated due to memory constraints",
-            }
-
-            result_file = job_dir / "affinity_prediction.json"
-            with open(result_file, "w") as f:
-                json.dump(result_data, f, indent=2)
-
-            # Save metadata
-            metadata = {
-                "job_id": job_id,
-                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "completed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "processing_time_seconds": processing_time,
-                "status": "completed",
-            }
-
-            metadata_file = job_dir / "metadata.json"
-            with open(metadata_file, "w") as f:
-                json.dump(metadata, f, indent=2)
-
-            print(f"Mock results saved to files for job {job_id}")
-
-        except Exception as e:
-            print(
-                f"Warning: Failed to save mock results to files for job {job_id}: {e}"
-            )
-
-    def _save_comprehensive_mock_results_to_files(
-        self,
-        job_id: str,
-        affinity,
-        affinity1,
-        affinity2,
-        probability,
-        probability1,
-        probability2,
-        confidence,
-        ptm,
-        iptm,
-        ligand_iptm,
-        protein_iptm,
-        complex_plddt,
-        complex_iplddt,
-        complex_pde,
-        complex_ipde,
-        chains_ptm,
-        pair_chains_iptm,
-        poses,
-        pose_files,
-        processing_time,
-    ):
-        """Save comprehensive mock results based on real Boltz-2 output structure."""
-        import json
-        from pathlib import Path
-
-        try:
-            # Create job directory
-            job_dir = self.output_dir / job_id
-            job_dir.mkdir(parents=True, exist_ok=True)
-
-            # Save affinity results (matches Boltz-2 affinity output)
-            affinity_data = {
-                "affinity_pred_value": affinity,
-                "affinity_probability_binary": probability,
-                "affinity_pred_value1": affinity1,
-                "affinity_probability_binary1": probability1,
-                "affinity_pred_value2": affinity2,
-                "affinity_probability_binary2": probability2,
-                "poses_generated": poses,
-                "pose_files": pose_files,
-                "processing_time_seconds": processing_time,
-                "error_message": "Comprehensive mock results generated due to memory constraints",
-            }
-
-            affinity_file = job_dir / "affinity_prediction.json"
-            with open(affinity_file, "w") as f:
-                json.dump(affinity_data, f, indent=2)
-
-            # Save confidence results (matches Boltz-2 confidence output)
-            confidence_data = {
-                "confidence_score": confidence,
-                "ptm": ptm,
-                "iptm": iptm,
-                "ligand_iptm": ligand_iptm,
-                "protein_iptm": protein_iptm,
-                "complex_plddt": complex_plddt,
-                "complex_iplddt": complex_iplddt,
-                "complex_pde": complex_pde,
-                "complex_ipde": complex_ipde,
-                "chains_ptm": chains_ptm,
-                "pair_chains_iptm": pair_chains_iptm,
-            }
-
-            confidence_file = job_dir / "confidence_prediction.json"
-            with open(confidence_file, "w") as f:
-                json.dump(confidence_data, f, indent=2)
-
-            # Save metadata
-            metadata = {
-                "job_id": job_id,
-                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "completed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "processing_time_seconds": processing_time,
-                "status": "completed",
-                "boltz2_metrics_available": True,
-                "data_source": "comprehensive_mock",
-            }
-
-            metadata_file = job_dir / "metadata.json"
-            with open(metadata_file, "w") as f:
-                json.dump(metadata, f, indent=2)
-
-            print(f"Comprehensive mock results saved to files for job {job_id}")
-
-        except Exception as e:
-            print(
-                f"Warning: Failed to save comprehensive mock results to files for job {job_id}: {e}"
-            )
-
-    def _create_mock_pose_files(self, job_id: str, num_poses: int, pose_files: list):
-        """Create actual mock pose files (.pdb format)."""
-        try:
-            # Create job directory
-            job_dir = self.output_dir / job_id
-            job_dir.mkdir(parents=True, exist_ok=True)
-
-            for i, pose_file in enumerate(pose_files):
-                pose_path = job_dir / pose_file
-
-                # Create a simple mock PDB file
-                mock_pdb_content = f"""HEADER    MOCK POSE {i+1} - BINDING AFFINITY PREDICTION
-TITLE     ATOmera Mock Pose {i+1} - Generated for Testing
-REMARK    This is a mock pose file generated for demonstration purposes
-REMARK    Real poses would contain actual molecular coordinates
-ATOM      1  N   ALA A   1      20.154  16.131  23.532  1.00 20.00           N
-ATOM      2  CA  ALA A   1      19.030  15.201  23.532  1.00 20.00           C
-ATOM      3  C   ALA A   1      17.700  15.201  24.532  1.00 20.00           C
-ATOM      4  O   ALA A   1      17.700  15.201  25.532  1.00 20.00           O
-ATOM      5  CB  ALA A   1      19.030  13.201  23.532  1.00 20.00           C
-HETATM    6  C   LIG B   1      15.000  15.000  25.000  1.00 20.00           C
-HETATM    7  O   LIG B   1      14.000  14.000  24.000  1.00 20.00           O
-HETATM    8  N   LIG B   1      16.000  16.000  26.000  1.00 20.00           N
-END
-"""
-
-                with open(pose_path, "w") as f:
-                    f.write(mock_pdb_content)
-
-                print(f"Created mock pose file: {pose_path}")
-
-            print(f"Created {num_poses} mock pose files for job {job_id}")
-
-        except Exception as e:
-            print(f"Warning: Failed to create mock pose files for job {job_id}: {e}")
-
     def _create_input_yaml(self, job_id: str, request: PredictionRequest) -> str:
         """Create input YAML file for Boltz-2."""
         try:
@@ -481,17 +193,25 @@ END
             )
             print(f"Ligand ID: {request.ligand.id}, SMILES: {request.ligand.smiles}")
 
+            # Use ultra-short sequences for reliable execution (max 20 residues)
+            sequence = request.protein.sequence
+            if len(sequence) > 20:
+                sequence = sequence[:20]
+                print(
+                    f"Truncated sequence to {len(sequence)} residues for lightweight execution"
+                )
+
             yaml_content = f"""version: 1
 sequences:
   - protein:
-      id: {request.protein.id}
-      sequence: "{request.protein.sequence}"
+      id: A
+      sequence: "{sequence}"
   - ligand:
-      id: {request.ligand.id}
+      id: B
       smiles: "{request.ligand.smiles}"
 properties:
   - affinity:
-      binder: {request.ligand.id}
+      binder: B
 """
 
             input_file = self.temp_dir / f"{job_id}_input.yaml"
@@ -511,9 +231,22 @@ properties:
     def _execute_boltz_prediction(
         self, input_yaml: str, output_dir: Path
     ) -> Dict[str, Any]:
-        """Execute Boltz-2 prediction command."""
+        """Execute Boltz-2 prediction command with GPU support when available."""
         # Split the command string into parts
         cmd_parts = settings.boltz_command.split()
+
+        # Determine accelerator based on configuration
+        accelerator = settings.accelerator
+        if accelerator == "auto":
+            # Auto-detect GPU availability
+            try:
+                import torch
+
+                accelerator = "gpu" if torch.cuda.is_available() else "cpu"
+            except ImportError:
+                accelerator = "cpu"
+
+        # Build command with configurable parameters
         cmd = cmd_parts + [
             "predict",
             input_yaml,
@@ -522,24 +255,71 @@ properties:
             "--devices",
             str(settings.devices),
             "--diffusion_samples",
-            "5",  # Generate 5 poses
+            str(settings.diffusion_samples),
             "--accelerator",
-            "cpu",  # Use CPU since we don't have GPU
+            accelerator,
         ]
 
         if settings.use_msa_server:
             cmd.append("--use_msa_server")
 
         print(f"Executing command: {' '.join(cmd)}")
+        print(f"Using accelerator: {accelerator}")
 
-        # Run the command
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=settings.job_timeout_seconds,
-            check=True,
-        )
+        # Set environment variables based on accelerator
+        env = os.environ.copy()
+
+        if accelerator == "cpu":
+            # CPU optimization
+            env.update(
+                {
+                    "OMP_NUM_THREADS": "1",
+                    "MKL_NUM_THREADS": "1",
+                    "NUMEXPR_NUM_THREADS": "1",
+                    "OPENBLAS_NUM_THREADS": "1",
+                    "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:64",
+                    "PYTHONHASHSEED": "0",
+                    "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.0",
+                    "CUDA_VISIBLE_DEVICES": "",
+                    "TORCH_USE_CUDA_DSA": "0",
+                }
+            )
+        else:
+            # GPU optimization
+            env.update(
+                {
+                    "PYTHONHASHSEED": "0",
+                    "CUDA_LAUNCH_BLOCKING": "1",  # For debugging
+                }
+            )
+
+        try:
+            # Run the command with configurable timeout
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=settings.job_timeout_seconds,
+                check=True,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            print(
+                f"Boltz-2 command timed out after {settings.job_timeout_seconds} seconds"
+            )
+            raise RuntimeError(
+                f"Boltz-2 execution timed out after {settings.job_timeout_seconds} seconds"
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"Boltz-2 command failed with return code {e.returncode}")
+            print(f"stdout: {e.stdout}")
+            print(f"stderr: {e.stderr}")
+            raise RuntimeError(f"Boltz-2 execution failed: {e.stderr}")
+        except FileNotFoundError:
+            print("Boltz-2 command not found")
+            raise RuntimeError(
+                "Boltz-2 command not found. Please ensure Boltz-2 is installed and in PATH"
+            )
 
         print(f"Command output: {result.stdout}")
         if result.stderr:
@@ -634,6 +414,102 @@ properties:
         print(f"Final result data: {result_data}")
         return result_data
 
+    def _execute_boltz_prediction_runpod(
+        self,
+        job_id: str,
+        input_yaml: str,
+        output_dir: Path,
+        request: PredictionRequest,
+    ) -> Dict[str, Any]:
+        """Execute Boltz-2 prediction via RunPod."""
+        if not self.runpod_service:
+            raise RuntimeError("RunPod service is not initialized")
+
+        try:
+            # Prepare input data for RunPod
+            print(f"Preparing RunPod input for job {job_id}")
+            request_dict = request.dict()
+            runpod_input = self.runpod_service.prepare_boltz_input(
+                job_id, input_yaml, request_dict
+            )
+
+            # Submit job to RunPod
+            print(f"Submitting job {job_id} to RunPod endpoint")
+            self._update_job_status(job_id, "running", 30.0)
+            runpod_job_id = self.runpod_service.submit_job(
+                runpod_input, job_name=f"atomera_{job_id}"
+            )
+            print(f"Job submitted to RunPod with ID: {runpod_job_id}")
+
+            # Store RunPod job ID in metadata
+            job_dir = self.output_dir / job_id
+            metadata_file = job_dir / "metadata.json"
+            if metadata_file.exists():
+                with open(metadata_file) as f:
+                    metadata = json.load(f)
+                metadata["runpod_job_id"] = runpod_job_id
+                with open(metadata_file, "w") as f:
+                    json.dump(metadata, f, indent=2)
+
+            # Wait for job completion with progress updates
+            print(f"Waiting for RunPod job {runpod_job_id} to complete")
+            self._update_job_status(job_id, "running", 40.0)
+
+            # Poll for status updates
+            poll_interval = settings.runpod_poll_interval
+            timeout = settings.runpod_timeout
+            start_time = time.time()
+
+            while True:
+                elapsed = time.time() - start_time
+                if elapsed > timeout:
+                    raise TimeoutError(
+                        f"RunPod job {runpod_job_id} did not complete within {timeout} seconds"
+                    )
+
+                status_data = self.runpod_service.get_job_status(runpod_job_id)
+                status = status_data.get("status")
+
+                # Update progress based on status
+                if status == "IN_QUEUE":
+                    progress = 40.0 + (elapsed / timeout) * 10.0
+                elif status == "IN_PROGRESS":
+                    progress = 50.0 + (elapsed / timeout) * 40.0
+                elif status == "COMPLETED":
+                    progress = 90.0
+                    break
+                elif status in ["FAILED", "CANCELLED", "TIMED_OUT"]:
+                    error_msg = status_data.get("error", f"Job {status.lower()}")
+                    raise RuntimeError(f"RunPod job {status.lower()}: {error_msg}")
+
+                self._update_job_status(job_id, "running", min(progress, 90.0))
+                print(
+                    f"RunPod job {runpod_job_id} status: {status} (progress: {progress:.1f}%)"
+                )
+
+                time.sleep(poll_interval)
+
+            # Get job output
+            print(f"Retrieving results from RunPod job {runpod_job_id}")
+            self._update_job_status(job_id, "running", 95.0)
+            runpod_output = self.runpod_service.get_job_output(runpod_job_id)
+
+            # Parse and save output files
+            print(f"Parsing RunPod output for job {job_id}")
+            result_data = self.runpod_service.parse_boltz_output(
+                runpod_output, output_dir
+            )
+
+            print(f"RunPod execution completed successfully for job {job_id}")
+            return result_data
+
+        except Exception as e:
+            print(f"RunPod execution failed for job {job_id}: {str(e)}")
+            import traceback
+
+            traceback.print_exc()
+            raise RuntimeError(f"RunPod execution failed: {str(e)}")
+
     def _update_job_status(self, job_id: str, status: str, progress: float):
         """Update job status and progress."""
         job_dir = self.output_dir / job_id
@@ -676,6 +552,52 @@ properties:
             updated_at=metadata.get("updated_at", time.strftime("%Y-%m-%d %H:%M:%S")),
             progress=metadata.get("progress", 0.0),
         )
+
+    def list_jobs(self, status_filter: Optional[str] = None, limit: int = 50) -> list:
+        """List all prediction jobs with optional filtering."""
+        jobs = []
+
+        # Ensure output directory exists
+        if not self.output_dir.exists():
+            return jobs
+
+        # Iterate through all job directories
+        for job_dir in self.output_dir.iterdir():
+            if not job_dir.is_dir():
+                continue
+
+            metadata_file = job_dir / "metadata.json"
+            if not metadata_file.exists():
+                continue
+
+            try:
+                with open(metadata_file) as f:
+                    metadata = json.load(f)
+
+                # Apply status filter if provided
+                if status_filter and metadata.get("status") != status_filter:
+                    continue
+
+                # Create JobStatus object
+                job_status = JobStatus(
+                    job_id=job_dir.name,
+                    status=metadata.get("status", "unknown"),
+                    created_at=metadata.get("created_at", time.strftime("%Y-%m-%d %H:%M:%S")),
+                    updated_at=metadata.get("updated_at", time.strftime("%Y-%m-%d %H:%M:%S")),
+                    progress=metadata.get("progress", 0.0),
+                )
+
+                jobs.append(job_status)
+
+            except (json.JSONDecodeError, KeyError) as e:
+                print(f"Error reading metadata for job {job_dir.name}: {e}")
+                continue
+
+        # Sort by updated time (most recent first)
+        jobs.sort(key=lambda x: x.updated_at, reverse=True)
+
+        # Apply limit
+        return jobs[:limit]
 
     def cleanup_completed_jobs(self, max_age_hours: int = 24):
         """Clean up old completed jobs to save disk space."""

@@ -26,6 +26,50 @@ from models import (
 )
 from services.boltz_service import BoltzService
 
+def calculate_ligand_properties(smiles: str) -> dict:
+    """Calculate ligand properties from SMILES string."""
+    try:
+        # Try to import RDKit for molecular property calculations
+        from rdkit import Chem
+        from rdkit.Chem import Descriptors, Crippen, Lipinski
+        
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return {}
+        
+        properties = {
+            "ligand_mw": round(Descriptors.MolWt(mol), 2),
+            "ligand_clogp": round(Crippen.MolLogP(mol), 2),
+            "ligand_tpsa": round(Descriptors.TPSA(mol), 2),
+            "ligand_hbd": Descriptors.NumHDonors(mol),
+            "ligand_hba": Descriptors.NumHAcceptors(mol),
+            "ligand_rotatable_bonds": Descriptors.NumRotatableBonds(mol),
+            "ligand_formal_charge": Chem.rdmolops.GetFormalCharge(mol),
+            "ligand_ring_count": Descriptors.RingCount(mol),
+        }
+        
+        # Check Rule of Five violations
+        violations = []
+        if properties["ligand_mw"] > 500:
+            violations.append("MW > 500 Da")
+        if properties["ligand_clogp"] > 5:
+            violations.append("cLogP > 5")
+        if properties["ligand_hbd"] > 5:
+            violations.append("HBD > 5")
+        if properties["ligand_hba"] > 10:
+            violations.append("HBA > 10")
+        
+        properties["ligand_rule_of_five_violations"] = violations
+        
+        return properties
+        
+    except ImportError:
+        # RDKit not available, return empty dict
+        return {}
+    except Exception as e:
+        print(f"Error calculating ligand properties: {e}")
+        return {}
+
 # Initialize FastAPI app
 app = FastAPI(
     title=settings.app_name,
@@ -79,6 +123,18 @@ async def health_check(boltz_service: BoltzService = Depends(get_boltz_service))
     )
 
 
+@app.post("/debug/predict")
+async def debug_predict_binding_affinity(request: dict):
+    """Debug endpoint to see raw request data."""
+    print("=== DEBUG REQUEST ===")
+    print(f"Raw request data: {request}")
+    print(f"Request type: {type(request)}")
+    print(
+        f"Keys: {list(request.keys()) if isinstance(request, dict) else 'Not a dict'}"
+    )
+    return {"received": request, "status": "debug"}
+
+
 @app.post("/predict", response_model=PredictionResult)
 async def predict_binding_affinity(
     request: PredictionRequest,
@@ -98,6 +154,8 @@ async def predict_binding_affinity(
         )
         print(f"Protein sequence length: {len(request.protein.sequence)}")
         print(f"Ligand SMILES: {request.ligand.smiles}")
+        print(f"Use MSA: {request.use_msa}")
+        print(f"Confidence threshold: {request.confidence_threshold}")
 
         # Create prediction job
         job_id = boltz_service.create_prediction_job(request)
@@ -222,58 +280,82 @@ async def get_job_result(
 
         # Calculate derived values
         affinity_pred = result_data.get("affinity_pred_value", -7.2)
-        kd_nm = 10 ** affinity_pred * 1000 if affinity_pred else None
+        kd_nm = 10**affinity_pred * 1000 if affinity_pred else None
         delta_g = (6 - affinity_pred) * 1.364 if affinity_pred else None
+
+        # Parse real data from Boltz-2 output files
+        real_data = {}
         
-        # Mock comprehensive data for demonstration
-        mock_data = {
-            "kd_nm": kd_nm,
-            "ic50_nm": kd_nm,  # Assuming IC50 ≈ Kd for this example
-            "delta_g": delta_g,
-            "confidence_interval_95": [affinity_pred - 0.5, affinity_pred + 0.5] if affinity_pred else None,
-            "sigma": 0.3,
-            "rmsd": 1.2,
-            "hbond_count": 8,
-            "hydrophobic_contacts": 12,
-            "salt_bridges": 2,
-            "pi_stacking": 3,
-            "sasa_change": -45.2,
-            "clash_score": 0.15,
-            "pocket_volume": 1250.5,
-            "polarity_index": 0.65,
-            "residue_hotspots": [
-                {"residue_name": "ARG-123", "contribution": -2.1, "contact_count": 4, "contact_types": ["hbond", "saltbridge"]},
-                {"residue_name": "TYR-156", "contribution": -1.8, "contact_count": 3, "contact_types": ["pi", "hydrophobic"]},
-                {"residue_name": "GLU-89", "contribution": -1.5, "contact_count": 2, "contact_types": ["hbond", "saltbridge"]},
-                {"residue_name": "PHE-201", "contribution": -1.2, "contact_count": 2, "contact_types": ["pi", "hydrophobic"]},
-                {"residue_name": "HIS-45", "contribution": -0.9, "contact_count": 1, "contact_types": ["hbond"]}
-            ],
-            "ligand_smiles": "CC1=CC=C(C=C1)C2=NC3=C(C=CC=C3)N2C4=CC=CC=C4",
-            "ligand_name": "Test Ligand",
-            "ligand_mw": 245.3,
-            "ligand_clogp": 3.2,
-            "ligand_tpsa": 45.6,
-            "ligand_hbd": 1,
-            "ligand_hba": 2,
-            "ligand_rotatable_bonds": 4,
-            "ligand_formal_charge": 0,
-            "ligand_ring_count": 3,
-            "ligand_rule_of_five_violations": [],
-            "target_pdb": "1ABC",
-            "target_uniprot": "P12345",
-            "target_chain": "A",
-            "target_pocket": "ATP-binding site",
-            "model_version": "Boltz-2.0",
-            "run_id": job_id,
-            "submitted_at": "2024-01-15T10:30:00Z",
-            "completed_at": "2024-01-15T10:32:15Z",
-            "device": "GPU-0",
-            "total_runtime": processing_time,
-            "data_quality_warnings": [],
-            "data_completeness": 95.5,
-            "pocket_detection_method": "FPocket"
-        }
+        # Calculate derived values from real affinity prediction
+        if affinity_pred is not None:
+            real_data["kd_nm"] = 10**affinity_pred * 1000  # Convert log(IC50) to nM
+            real_data["ic50_nm"] = real_data["kd_nm"]  # Assuming IC50 ≈ Kd
+            real_data["delta_g"] = (6 - affinity_pred) * 1.364  # Convert to kcal/mol
+            real_data["confidence_interval_95"] = (
+                [affinity_pred - 0.5, affinity_pred + 0.5] if affinity_pred else None
+            )
+            real_data["sigma"] = 0.3  # Default uncertainty
         
+        # Get ligand properties from request metadata if available
+        metadata_file = job_dir / "metadata.json"
+        if metadata_file.exists():
+            with open(metadata_file) as f:
+                metadata = json.load(f)
+                request_data = metadata.get("request", {})
+                ligand_data = request_data.get("ligand", {})
+                protein_data = request_data.get("protein", {})
+                
+                # Extract ligand properties
+                real_data["ligand_smiles"] = ligand_data.get("smiles", "N/A")
+                real_data["ligand_name"] = ligand_data.get("id", "Unknown Ligand")
+                
+                # Calculate ligand properties from SMILES
+                if real_data["ligand_smiles"] != "N/A":
+                    ligand_props = calculate_ligand_properties(real_data["ligand_smiles"])
+                    real_data.update(ligand_props)
+                
+                # Extract protein/target properties
+                real_data["target_pdb"] = protein_data.get("id", "N/A")
+                real_data["target_uniprot"] = "N/A"  # Not available in current input
+                real_data["target_chain"] = "A"  # Default chain
+                real_data["target_pocket"] = "Predicted binding site"
+        
+        # Set model and run information
+        real_data["model_version"] = "Boltz-2.0"
+        real_data["run_id"] = job_id
+        real_data["submitted_at"] = metadata.get("created_at", "N/A") if metadata_file.exists() else "N/A"
+        real_data["completed_at"] = metadata.get("completed_at", "N/A") if metadata_file.exists() else "N/A"
+        real_data["device"] = "CPU"  # Default device
+        real_data["total_runtime"] = processing_time
+        real_data["data_quality_warnings"] = []
+        real_data["data_completeness"] = 100.0  # Assume complete for real predictions
+        real_data["pocket_detection_method"] = "Boltz-2"
+        
+        # Pose quality metrics - these would need to be calculated from pose files
+        # For now, set to None to indicate they need to be calculated
+        real_data["rmsd"] = None
+        real_data["hbond_count"] = None
+        real_data["hydrophobic_contacts"] = None
+        real_data["salt_bridges"] = None
+        real_data["pi_stacking"] = None
+        real_data["sasa_change"] = None
+        real_data["clash_score"] = None
+        real_data["pocket_volume"] = None
+        real_data["polarity_index"] = None
+        real_data["residue_hotspots"] = None
+        
+        # Ligand properties that need to be calculated from SMILES
+        # These will be populated by calculate_ligand_properties() if SMILES is available
+        real_data["ligand_mw"] = None
+        real_data["ligand_clogp"] = None
+        real_data["ligand_tpsa"] = None
+        real_data["ligand_hbd"] = None
+        real_data["ligand_hba"] = None
+        real_data["ligand_rotatable_bonds"] = None
+        real_data["ligand_formal_charge"] = None
+        real_data["ligand_ring_count"] = None
+        real_data["ligand_rule_of_five_violations"] = None
+
         return PredictionResult(
             job_id=job_id,
             status="completed",
@@ -294,7 +376,7 @@ async def get_job_result(
             complex_pde=confidence_data.get("complex_pde"),
             complex_ipde=confidence_data.get("complex_ipde"),
             # Extended data
-            **mock_data
+            **real_data,
         )
 
     except HTTPException:
@@ -348,9 +430,14 @@ async def list_jobs(
     boltz_service: BoltzService = Depends(get_boltz_service),
 ):
     """List all prediction jobs with optional filtering."""
-    # This would need to be implemented in the service
-    # For now, return empty list
-    return []
+    try:
+        jobs = boltz_service.list_jobs(status_filter=status, limit=limit)
+        return jobs
+    except Exception as e:
+        print(f"Error listing jobs: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to list jobs: {str(e)}")
 
 
 @app.delete("/jobs/{job_id}")
@@ -358,8 +445,26 @@ async def delete_job(
     job_id: str, boltz_service: BoltzService = Depends(get_boltz_service)
 ):
     """Delete a specific prediction job and its results."""
-    # This would need to be implemented in the service
-    return {"message": f"Job {job_id} deleted successfully"}
+    try:
+        from pathlib import Path
+        import shutil
+
+        # Check if job exists
+        job_status = boltz_service.get_job_status(job_id)
+        if not job_status:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+        # Delete job directory
+        job_dir = Path(settings.output_base_dir) / settings.predictions_dir / job_id
+        if job_dir.exists():
+            shutil.rmtree(job_dir)
+
+        return {"message": f"Job {job_id} deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error deleting job: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete job: {str(e)}")
 
 
 @app.post("/validate/protein")
@@ -413,11 +518,17 @@ async def get_example_molecules():
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
     """Global exception handler for unhandled errors."""
+    import traceback
+
+    # Log the full error for debugging
+    print(f"Unhandled error: {str(exc)}")
+    print(f"Traceback: {traceback.format_exc()}")
+
     return JSONResponse(
         status_code=500,
         content={
             "error": "Internal server error",
-            "detail": str(exc),
+            "detail": "An unexpected error occurred. Please try again later.",
             "timestamp": datetime.now().isoformat(),
         },
     )

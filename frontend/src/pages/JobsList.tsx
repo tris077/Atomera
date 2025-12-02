@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -9,14 +9,22 @@ import { jobService, Job } from '@/lib/jobService';
 import StatusBadge, { JobStatus } from '@/components/StatusBadge';
 import MolecularBackground from '@/components/MolecularBackground';
 import Navigation from '@/components/Navigation';
-import { Plus, Search, Eye, RefreshCw } from 'lucide-react';
+import { Plus, Search, Eye, RefreshCw, Trash2, Sparkles } from 'lucide-react';
+import { addMockJobToLocalStorage } from '@/utils/createMockJob';
 
 const JobsList: React.FC = () => {
+  const navigate = useNavigate();
   const [jobs, setJobs] = useState<Job[]>([]);
   const [filteredJobs, setFilteredJobs] = useState<Job[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('all');
   const [isRefreshing, setIsRefreshing] = useState(false);
+
+  const handleCreateDemoJob = () => {
+    const mockJob = addMockJobToLocalStorage();
+    loadJobs(); // Refresh the list
+    navigate(`/job/${mockJob.id}/results`);
+  };
 
   const loadJobs = async () => {
     setIsRefreshing(true);
@@ -30,8 +38,30 @@ const JobsList: React.FC = () => {
     }
   };
 
+  const clearAllJobs = async () => {
+    if (window.confirm('Are you sure you want to clear all jobs? This action cannot be undone.')) {
+      try {
+        // First sync with backend to remove jobs that no longer exist
+        await jobService.syncWithBackend();
+        // Then clear all local jobs
+        jobService.clearAllJobs();
+        await loadJobs();
+        console.log('All jobs cleared successfully');
+      } catch (error) {
+        console.error('Failed to clear jobs:', error);
+      }
+    }
+  };
+
   useEffect(() => {
-    loadJobs();
+    const initializeJobs = async () => {
+      // First sync with backend to remove orphaned jobs
+      await jobService.syncWithBackend();
+      // Then load all jobs
+      await loadJobs();
+    };
+    
+    initializeJobs();
   }, []);
 
   useEffect(() => {
@@ -86,7 +116,7 @@ const JobsList: React.FC = () => {
             <p className="text-muted-foreground">Manage your binding affinity analyses</p>
           </div>
           
-          <div className="flex gap-2">
+          <div className="flex gap-2 flex-wrap">
             <Button
               variant="outline"
               size="sm"
@@ -94,6 +124,24 @@ const JobsList: React.FC = () => {
               disabled={isRefreshing}
             >
               <RefreshCw className={`h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`} />
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={clearAllJobs}
+              disabled={isRefreshing}
+              className="text-destructive hover:text-destructive"
+            >
+              <Trash2 className="h-4 w-4" />
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleCreateDemoJob}
+              className="border-dashed hover:bg-primary/10 hover:border-primary"
+            >
+              <Sparkles className="h-4 w-4 mr-1 text-primary" />
+              Demo
             </Button>
             <Button asChild variant="hero">
               <Link to="/job/new">
@@ -240,14 +288,24 @@ const JobsList: React.FC = () => {
                         <TableCell>
                           <div className="flex gap-1">
                             {job.status === 'completed' ? (
-                              <Button asChild variant="ghost" size="sm">
+                              <Button
+                                asChild
+                                variant="ghost"
+                                size="sm"
+                                className="hover:bg-primary hover:text-primary-foreground transition-smooth"
+                              >
                                 <Link to={`/job/${job.id}/results`}>
                                   <Eye className="h-3 w-3 mr-1" />
                                   Results
                                 </Link>
                               </Button>
                             ) : (
-                              <Button asChild variant="ghost" size="sm">
+                              <Button
+                                asChild
+                                variant="ghost"
+                                size="sm"
+                                className="hover:bg-primary/10 transition-smooth"
+                              >
                                 <Link to={`/job/${job.id}/status`}>
                                   <Eye className="h-3 w-3 mr-1" />
                                   Status

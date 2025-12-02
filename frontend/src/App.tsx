@@ -8,6 +8,7 @@ import NewJob from "./pages/NewJob";
 import JobStatus from "./pages/JobStatus";
 import JobResults from "./pages/JobResults";
 import JobsList from "./pages/JobsList";
+import Viewer3D from "./pages/Viewer3D";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -24,6 +25,7 @@ const App = () => (
           <Route path="/job/new" element={<NewJob />} />
           <Route path="/job/:id/status" element={<JobStatus />} />
           <Route path="/job/:id/results" element={<JobResults />} />
+          <Route path="/job/:id/viewer" element={<Viewer3D />} />
           {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
           <Route path="*" element={<NotFound />} />
         </Routes>
